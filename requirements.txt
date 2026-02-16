@@ -1,0 +1,6 @@
+streamlit
+pandas
+altair
+google-cloud-bigquery
+db-dtypes
+pyarrow
