@@ -940,9 +940,10 @@ def show_tile_modal(selected_date, selected_course, month_df):
 def load_channel_availability(date_str, course):
     """Load channel availability with lifecycle tracking for specific date"""
     try:
-        client = bigquery.Client.from_service_account_json(
-            "D:\\Aman\\Web Scraping\\Golf Rateshop\\golf_credential.json"
-        )
+        # client = bigquery.Client.from_service_account_json(
+        #     "D:\\Aman\\Web Scraping\\Golf Rateshop\\golf_credential.json"
+        # )
+        client = get_bq_client() # Updated to use helper function for credentials
         
         query = f"""
         WITH normalized AS (
@@ -1132,9 +1133,10 @@ def load_channel_availability(date_str, course):
 def load_history_chart(date_str):
     """Load rate shop history for chart - shows price trends across multiple dates"""
     try:
-        client = bigquery.Client.from_service_account_json(
-            "D:\\Aman\\Web Scraping\\Golf Rateshop\\golf_credential.json"
-        )
+        # client = bigquery.Client.from_service_account_json(
+        #     "D:\\Aman\\Web Scraping\\Golf Rateshop\\golf_credential.json"
+        # )
+        client = get_bq_client() # Updated to use helper function for credentials
         
         query = f"""
         WITH normalized AS (
