@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 from google.cloud import bigquery
-from datetime import datetime
+from datetime import datetime, date
 import calendar
 
 # --------------------------
@@ -271,6 +271,16 @@ st.markdown("""
 PROJECT_ID = "tee-metrics-golf-tee-time"
 TABLE_ID = "RateShop Query"
 
+COURSES = [
+    "coyote_ridge_golf_club",
+    "bear_creek_golf_club_west",
+    "irving_golf_club",
+    "mesquite_golf_club",
+    "prairie_lakes_golf_course",
+    "riverside_golf_club_dallas",
+    "thorntree_golf_club"
+]
+
 st.set_page_config(layout="wide")
 
 def get_bq_client():
@@ -460,6 +470,269 @@ def load_data():
         st.error(f"Error loading data: {str(e)}")
         return pd.DataFrame()
 
+
+@st.cache_data(ttl=300)
+def fetch_benchmark_data(as_of_start, as_of_end, checkin_start, checkin_end, channel):
+        client = get_bq_client()
+        query = f"""
+        WITH normalized AS (
+            SELECT
+                CASE
+                    WHEN course_name IN ('thorntree_golf_club','thorntree_country_club')
+                        THEN 'thorntree_golf_club'
+                    WHEN course_name IN (
+                        'riverside_golf_club_-_dallas',
+                        'riverside_golf_club',
+                        'riverside_g.c.'
+                    ) THEN 'riverside_golf_club_dallas'
+                    WHEN course_name IN (
+                        'bear_creek',
+                        'bear_creek_golf_club_-_west',
+                        'bear_creek_golf_club_-_west_course'
+                    ) THEN 'bear_creek_golf_club_west'
+                    ELSE course_name
+                END AS course_name,
+                source_channel,
+                DATE(scrape_timestamp) AS as_of_date,
+                DATE(tee_date) AS tee_date,
+                tee_time,
+                price,
+                scrape_timestamp
+            FROM `{PROJECT_ID}.golf_silver.tee_time_clean`
+            WHERE DATE(scrape_timestamp) BETWEEN DATE('{as_of_start}')
+                                                                     AND DATE('{as_of_end}')
+                AND DATE(tee_date) BETWEEN DATE('{checkin_start}')
+                                                             AND DATE('{checkin_end}')
+                AND ('{channel}' = 'ALL' OR source_channel = '{channel}')
+        ),
+        daily_last_scrape AS (
+            SELECT
+                course_name,
+                source_channel,
+                as_of_date,
+                tee_date,
+                MAX(scrape_timestamp) AS last_scrape_of_day
+            FROM normalized
+            GROUP BY course_name, source_channel, as_of_date, tee_date
+        ),
+        slot_lifecycle AS (
+            SELECT
+                n.course_name,
+                n.source_channel,
+                n.as_of_date,
+                n.tee_date,
+                n.tee_time,
+                MIN(n.scrape_timestamp) AS first_seen_at,
+                MAX(n.scrape_timestamp) AS last_seen_at,
+                AVG(n.price) AS avg_slot_price
+            FROM normalized n
+            GROUP BY n.course_name, n.source_channel, n.as_of_date, n.tee_date, n.tee_time
+        ),
+        occupancy_labeled AS (
+            SELECT
+                s.course_name,
+                s.source_channel,
+                s.as_of_date,
+                s.tee_date,
+                s.avg_slot_price,
+                CASE
+                    WHEN s.last_seen_at < d.last_scrape_of_day THEN 1
+                    ELSE 0
+                END AS occupied_flag
+            FROM slot_lifecycle s
+            JOIN daily_last_scrape d
+                ON s.course_name = d.course_name
+             AND s.source_channel = d.source_channel
+             AND s.as_of_date = d.as_of_date
+             AND s.tee_date = d.tee_date
+        ),
+        daily_summary AS (
+            SELECT
+                as_of_date,
+                tee_date,
+                course_name,
+                ROUND(AVG(avg_slot_price),0) AS avg_price,
+                ROUND(100 * SAFE_DIVIDE(SUM(occupied_flag), COUNT(*)),0) AS occ_percent
+            FROM occupancy_labeled
+            GROUP BY as_of_date, tee_date, course_name
+        ),
+        market_summary AS (
+            SELECT
+                as_of_date,
+                tee_date,
+                MIN(avg_price) AS market_min,
+                MAX(avg_price) AS market_max,
+                ROUND(AVG(avg_price),0) AS market_avg
+            FROM daily_summary
+            GROUP BY as_of_date, tee_date
+        )
+        SELECT
+            d.as_of_date,
+            d.tee_date,
+            d.course_name,
+            d.avg_price,
+            d.occ_percent,
+            m.market_avg,
+            m.market_min,
+            m.market_max
+        FROM daily_summary d
+        JOIN market_summary m
+            ON d.as_of_date = m.as_of_date
+         AND d.tee_date = m.tee_date
+        ORDER BY as_of_date, tee_date, avg_price
+        """
+        return client.query(query).to_dataframe()
+
+
+def build_benchmark_header(checkin_dates):
+        header_cells = ["AS OF DATE"] + [pd.to_datetime(d).strftime("%m/%d") for d in checkin_dates] + ["HIGH", "LOW"]
+        th_cells = "".join([f"<th class='bench-th'>{c}</th>" for c in header_cells])
+        return f"""
+        <table class='bench-table'>
+            <thead>
+                <tr>{th_cells}</tr>
+            </thead>
+        </table>
+        """
+
+
+def build_benchmark_row_html(as_of_df, property_selected, as_of_value, checkin_dates):
+        self_df = as_of_df[as_of_df["course_name"] == property_selected]
+        if self_df.empty:
+                return ""
+
+        rank_df = as_of_df.copy()
+        rank_df["rank_high"] = rank_df.groupby("tee_date")["avg_price"] \
+                .rank(method="min", ascending=False)
+        rank_df["rank_low"] = rank_df.groupby("tee_date")["avg_price"] \
+                .rank(method="min", ascending=True)
+        self_rank = rank_df[rank_df["course_name"] == property_selected]
+        high_count = int((self_rank["rank_high"] == 1).sum())
+        low_count = int((self_rank["rank_low"] == 1).sum())
+
+        cells_html = []
+        as_of_label = pd.to_datetime(as_of_value).strftime("%m/%d")
+        cells_html.append(f"<td class='bench-td bench-date'>{as_of_label}</td>")
+
+        for d in checkin_dates:
+                cell_df = self_df[self_df["tee_date"] == d]
+                self_val = cell_df["avg_price"].mean()
+                market_val = cell_df["market_avg"].mean()
+                if pd.isna(self_val) and pd.isna(market_val):
+                        cell = ""
+                else:
+                        self_text = f"${self_val:.0f}" if pd.notna(self_val) else ""
+                        market_text = f"${market_val:.0f}" if pd.notna(market_val) else ""
+                        if pd.notna(self_val) and pd.notna(market_val):
+                                self_color = "#22c55e" if self_val <= market_val else "#ef4444"
+                        else:
+                                self_color = "#9ca3af"
+                        cell = (
+                                f"<div class='bench-top' style='color:{self_color};'>{self_text}</div>"
+                                f"<div class='bench-bottom'>{market_text}</div>"
+                        )
+                cells_html.append(f"<td class='bench-td bench-price'>{cell}</td>")
+
+        cells_html.append(f"<td class='bench-td bench-meta'>{high_count}</td>")
+        cells_html.append(f"<td class='bench-td bench-meta'>{low_count}</td>")
+
+        row_html = "".join(cells_html)
+        return f"""
+        <table class='bench-table'>
+            <tbody>
+                <tr>{row_html}</tr>
+            </tbody>
+        </table>
+        """
+
+
+def build_benchmark_price_trend_chart(as_of_df, property_selected):
+        chart_df = as_of_df[as_of_df["course_name"] == property_selected].copy()
+        chart_df["tee_date"] = pd.to_datetime(chart_df["tee_date"])
+        base = alt.Chart(chart_df).encode(
+                x=alt.X("tee_date:T", title="Check-in Date")
+        )
+        whisker = base.mark_rule(
+                color="white",
+                strokeWidth=2
+        ).encode(
+                y="market_min:Q",
+                y2="market_max:Q"
+        )
+        top_cap = base.mark_tick(
+                color="white",
+                thickness=2,
+                size=20
+        ).encode(
+                y="market_max:Q"
+        )
+        bottom_cap = base.mark_tick(
+                color="white",
+                thickness=2,
+                size=20
+        ).encode(
+                y="market_min:Q"
+        )
+        market_line = base.mark_line(
+                color="white",
+                strokeWidth=2
+        ).encode(
+                y="market_avg:Q"
+        )
+        market_points = base.mark_circle(
+                color="white",
+                size=60
+        ).encode(
+                y="market_avg:Q"
+        )
+        self_line = base.mark_line(
+                color="#22c55e",
+                strokeWidth=3
+        ).encode(
+                y="avg_price:Q"
+        )
+        self_points = base.mark_circle(
+                color="#22c55e",
+                size=80
+        ).encode(
+                y="avg_price:Q",
+                tooltip=[
+                        alt.Tooltip("tee_date:T", title="Date"),
+                        alt.Tooltip("avg_price:Q", title="Self", format="$,.0f"),
+                        alt.Tooltip("market_avg:Q", title="Avg", format="$,.0f"),
+                        alt.Tooltip("market_min:Q", title="Min", format="$,.0f"),
+                        alt.Tooltip("market_max:Q", title="Max", format="$,.0f"),
+                ]
+        )
+        chart = (
+                whisker
+                + top_cap
+                + bottom_cap
+                + market_line
+                + market_points
+                + self_line
+                + self_points
+        ).properties(height=420)
+        st.altair_chart(chart, use_container_width=True)
+
+
+def build_benchmark_competitor_matrix(as_of_df, property_selected):
+        comp_matrix = as_of_df.pivot_table(
+                index="course_name",
+                columns="tee_date",
+                values="avg_price"
+        )
+        comp_matrix = comp_matrix.reindex(COURSES)
+        comp_matrix.columns = [
+                pd.to_datetime(c).strftime("%m/%d")
+                for c in comp_matrix.columns
+        ]
+        ordered_courses = [property_selected] + [
+                c for c in COURSES if c != property_selected
+        ]
+        comp_matrix = comp_matrix.loc[ordered_courses]
+        st.dataframe(comp_matrix, use_container_width=True)
+
 df = load_data()
 
 if df.empty:
@@ -483,34 +756,113 @@ if "tile_modal_date" not in st.session_state:
 with st.sidebar:
     st.markdown("### ⚙️ Controls")
 
+    screen = st.selectbox(
+        "Screen",
+        ["Rate Shop", "Benchmarking"]
+    )
+
     if st.button("🔄 Refresh Data"):
         st.cache_data.clear()
         st.rerun()
-    
-    courses = sorted(df["course_name"].unique())
-    selected_course = st.selectbox(
-        "Select Your Course",
-        courses,
-        index=courses.index("coyote_ridge_golf_club") if "coyote_ridge_golf_club" in courses else 0
-    )
-    
-    # Month and Year selection
-    col1, col2 = st.columns(2)
+
+    if screen == "Rate Shop":
+        courses = sorted(df["course_name"].unique())
+        selected_course = st.selectbox(
+            "Select Your Course",
+            courses,
+            index=courses.index("coyote_ridge_golf_club") if "coyote_ridge_golf_club" in courses else 0
+        )
+
+        # Month and Year selection
+        col1, col2 = st.columns(2)
+        with col1:
+            selected_month_num = st.selectbox(
+                "Month",
+                range(1, 13),
+                index=1,  # February
+                format_func=lambda x: datetime(2026, x, 1).strftime('%B')
+            )
+        with col2:
+            selected_year = st.selectbox(
+                "Year",
+                range(2024, 2031),
+                index=2  # 2026
+            )
+
+        selected_month = datetime(selected_year, selected_month_num, 1)
+
+if screen == "Benchmarking":
+    st.title("🏌️ Golf Benchmarking")
+
+    col1, col2, col3, col4 = st.columns([2, 1, 2, 1])
     with col1:
-        selected_month_num = st.selectbox(
-            "Month",
-            range(1, 13),
-            index=1,  # February
-            format_func=lambda x: datetime(2026, x, 1).strftime('%B')
+        property_selected = st.selectbox(
+            "Property (Self)",
+            COURSES,
+            index=0
         )
     with col2:
-        selected_year = st.selectbox(
-            "Year",
-            range(2024, 2031),
-            index=2  # 2026
+        as_of_range = st.date_input(
+            "As of Dates",
+            (date(2026, 2, 18), date(2026, 2, 24))
         )
-    
-    selected_month = datetime(selected_year, selected_month_num, 1)
+    with col3:
+        checkin_range = st.date_input(
+            "Check-In Dates",
+            (date(2026, 2, 18), date(2026, 3, 4))
+        )
+    with col4:
+        channel = st.selectbox(
+            "Channel",
+            ["ALL", "brand", "golfnow", "teeoff", "supremegolf"]
+        )
+
+    checkin_start, checkin_end = checkin_range
+    if isinstance(as_of_range, tuple):
+        as_of_start, as_of_end = as_of_range
+    else:
+        as_of_start = as_of_range
+        as_of_end = as_of_range
+
+    bench_df = fetch_benchmark_data(as_of_start, as_of_end, checkin_start, checkin_end, channel)
+    if bench_df.empty:
+        st.warning("No data found.")
+        st.stop()
+
+    st.subheader("Benchmarking by As-Of Date")
+    st.markdown(
+        """
+        <style>
+          .bench-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+          .bench-th, .bench-td { border: 1px solid #2a2f3a; padding: 8px 6px; text-align: center; font-size: 12px; }
+          .bench-th { background: #1f2937; color: #e5e7eb; font-weight: 600; }
+          .bench-date { text-align: left; font-weight: 600; color: #e5e7eb; background: #111827; }
+          .bench-price { background: #0f172a; }
+          .bench-top { font-weight: 700; line-height: 1.1; }
+          .bench-bottom { color: #e5e7eb; opacity: 0.9; line-height: 1.1; }
+          .bench-meta { background: #111827; color: #e5e7eb; font-weight: 600; }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+    as_of_dates = sorted(bench_df["as_of_date"].unique(), reverse=True)
+    checkin_dates = sorted(bench_df["tee_date"].unique())
+    st.markdown(build_benchmark_header(checkin_dates), unsafe_allow_html=True)
+
+    for as_of_value in as_of_dates:
+        as_of_df = bench_df[bench_df["as_of_date"] == as_of_value]
+        label = pd.to_datetime(as_of_value).strftime("%Y/%m/%d")
+        row_html = build_benchmark_row_html(as_of_df, property_selected, as_of_value, checkin_dates)
+        if row_html:
+            st.markdown(row_html, unsafe_allow_html=True)
+        with st.expander(f"Details for {label}", expanded=False):
+            st.markdown("**Price Trend**")
+            build_benchmark_price_trend_chart(as_of_df, property_selected)
+            with st.expander("Show Competitor Data", expanded=False):
+                build_benchmark_competitor_matrix(as_of_df, property_selected)
+
+    st.stop()
 
 # --------------------------
 # DATA FILTERING
